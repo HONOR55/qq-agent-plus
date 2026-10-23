@@ -71,7 +71,8 @@ export class PluginRegistry {
    */
   constructor({
     root, dataDir, log = () => {}, getConfig = () => ({}), hostFactory = null, timeouts = {},
-    probe = probeIsolation, scheduleIntervalMs = 15000, getIndexRevoked = () => [], getSender = () => null
+    probe = probeIsolation, scheduleIntervalMs = 15000, getIndexRevoked = () => [], getSender = () => null,
+    getQzone = () => null
   } = {}) {
     this.root = root;
     this.dataDir = dataDir;
@@ -88,6 +89,9 @@ export class PluginRegistry {
     // 发送队列（插件声明 send 能力后由宿主注入）：**必须是机器人自己那条队列** ——
     // 插件发言要与非活跃时间、观察/暂停模式、群白名单、禁言预检、限频、outbox 记账共用同一套守卫。
     this.getSender = typeof getSender === 'function' ? getSender : () => null;
+    // QQ 空间网关（插件声明 qzone 能力后用）：写操作只走宿主与协议端那条连接，
+    // 插件进程自己既没有网络也没有令牌 —— 这条注入是它唯一的出口。
+    this.getQzone = typeof getQzone === 'function' ? getQzone : () => null;
     this.hosts = new Map();      // id -> PluginHost
     this.discovered = [];        // [{ id, dir, manifest, error }]
     this.opChain = Promise.resolve(); // 起停/重载/安装的串行队列（见 #serialize）
@@ -266,6 +270,7 @@ export class PluginRegistry {
         requireNetworkIsolation: cfg.requireNetworkIsolation,
         limits: cfg.limits,
         getSender: () => this.getSender(),
+        getQzone: () => this.getQzone(),
         getSettings: () => this.#config().settings[item.id] ?? {}
       });
   }

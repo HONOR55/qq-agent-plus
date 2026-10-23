@@ -52,6 +52,7 @@ export class PluginHost {
    */
   constructor({
     manifest, dataDir, log = () => {}, getSettings = () => ({}), getSender = () => null,
+    getQzone = () => null,
     spawn = spawnChild, spawnSyncImpl = spawnSync, nodePath = process.execPath,
     timeouts = {}, capabilities = null, now = () => Date.now(), requireIsolation = true,
     networkIsolation = true, requireNetworkIsolation = false, limits = {}
@@ -81,7 +82,8 @@ export class PluginHost {
     this.netIsolated = false;
     this.caps = capabilities ?? createCapabilities({
       pluginId: this.id, dataDir, getSettings, log, now,
-      getSender      // send 能力用：插件发言必须走机器人自己那条队列（守卫全在里面）
+      getSender,     // send 能力用：插件发言必须走机器人自己那条队列（守卫全在里面）
+      getQzone      // qzone 能力用：发/删/赞/评都走宿主与协议端的那条连接
     });
 
     this.state = 'idle';           // idle | starting | running | stopping | stopped | failed

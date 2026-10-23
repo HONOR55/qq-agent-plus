@@ -30,7 +30,16 @@ export const CAP_METHODS = Object.freeze({
   storageSet: `${CAP_PREFIX}storage.set`,
   configGet: `${CAP_PREFIX}config.get`,
   httpRequest: `${CAP_PREFIX}http.request`,
-  sendText: `${CAP_PREFIX}send.text`
+  sendText: `${CAP_PREFIX}send.text`,
+  // QQ 空间：读是只读，写（publish/delete/like/comment）是**公开可见**的副作用，
+  // 所以方法名按动作拆开，鉴权与限频都能逐个管，不给一个"随便调空间接口"的总入口。
+  qzonePublish: `${CAP_PREFIX}qzone.publish`,
+  qzoneMine: `${CAP_PREFIX}qzone.mine`,
+  qzoneDelete: `${CAP_PREFIX}qzone.delete`,
+  qzoneFeeds: `${CAP_PREFIX}qzone.feeds`,
+  qzoneLike: `${CAP_PREFIX}qzone.like`,
+  qzoneComment: `${CAP_PREFIX}qzone.comment`,
+  qzoneComments: `${CAP_PREFIX}qzone.comments`
 });
 
 /** 能力方法 → 需要声明的能力名（鉴权用；漏一条就是"没声明也能用"）。 */
@@ -40,7 +49,14 @@ export const CAP_REQUIREMENT = Object.freeze({
   [CAP_METHODS.storageSet]: 'storage',
   [CAP_METHODS.configGet]: 'config',
   [CAP_METHODS.httpRequest]: 'http',
-  [CAP_METHODS.sendText]: 'send'
+  [CAP_METHODS.sendText]: 'send',
+  [CAP_METHODS.qzonePublish]: 'qzone',
+  [CAP_METHODS.qzoneMine]: 'qzone',
+  [CAP_METHODS.qzoneDelete]: 'qzone',
+  [CAP_METHODS.qzoneFeeds]: 'qzone',
+  [CAP_METHODS.qzoneLike]: 'qzone',
+  [CAP_METHODS.qzoneComment]: 'qzone',
+  [CAP_METHODS.qzoneComments]: 'qzone'
 });
 
 export const MAX_LINE_BYTES = 1024 * 1024;   // 单行上限：插件不能靠"吐一大坨"把宿主内存打满

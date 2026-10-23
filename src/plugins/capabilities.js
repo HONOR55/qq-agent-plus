@@ -35,7 +35,7 @@ export function pluginDataDir(dataDir, pluginId) {
  */
 export function createCapabilities({
   pluginId, dataDir, getSettings = () => ({}), log = () => {}, now = () => Date.now(),
-  getSender = () => null
+  getSender = () => null, getQzone = () => null
 } = {}) {
   // 注入点先落到本地常量：`node src/ops.js scan --strict`（CI 门禁）只认 const/let 声明与
   // KNOWN_IGNORE 里的名字，**直接调用解构参数的默认值会被判成"未定义调用"**
@@ -43,6 +43,7 @@ export function createCapabilities({
   const settingsOf = getSettings;
   const nowFn = now;
   const senderOf = getSender;
+  const qzoneOf = getQzone;
   const dir = pluginDataDir(dataDir, pluginId);
   const storageFile = path.join(dir, 'storage.json');
   let storage = null;
@@ -170,6 +171,14 @@ export function createCapabilities({
       };
     }
   };
+
+  // QQ 空间：网关按插件 id 绑一份（写入配额按插件独立计数，一个插件刷屏不该拖累别的插件）。
+  // 没接网关（单元测试 / 独立启动）时这一组方法**不存在** —— 调用会走"未声明能力"那条路被拒，
+  // 不会静默成功。
+  if (typeof qzoneOf === 'function') {
+    const bound = qzoneOf()?.bind?.(pluginId);
+    if (bound?.methods) Object.assign(methods, bound.methods);
+  }
 
   return {
     methods,

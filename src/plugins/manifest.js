@@ -30,8 +30,10 @@ export const PLUGIN_CAPABILITIES = Object.freeze([
   'log',        // 经宿主写日志（带插件前缀 + 脱敏）
   'storage',    // 经宿主读写自己那点状态（宿主侧落盘，插件进程没有写权限）
   'config',     // 读自己那段配置（plugins.settings.<id>）
-  'send'        // **代机器人发言**（走宿主的发送队列：非活跃时间、观察/暂停模式、群白名单、
+  'send',       // **代机器人发言**（走宿主的发送队列：非活跃时间、观察/暂停模式、群白名单、
                 //  禁言预检、限频、outbox 记账全都在里面）。信任面最大的一条，界面上会明确标出来
+  'qzone'       // **QQ 空间读写**（发/删说说、看好友动态、点赞、评论）。写出去的每一条都是
+                //  公开可见的，宿主侧另有按插件计的每分钟/每小时上限与逐条审计日志
 ]);
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{1,31}$/;
@@ -162,14 +164,6 @@ export function parsePluginManifest(raw, { dir = '' } = {}) {
     const result = validateTool(item, index);
     if (result.error) return { ok: false, error: result.error };
     if (tools.some((t) => t.name === result.tool.name)) return { ok: false, error: `工具名重复：${result.tool.name}` };
-    // OpenAI function name 上限 64；`<id>__<tool>` 最长可达 32+2+32=66，严格端点会 400
-    // 整轮请求（不只是这个工具不可用）。安装时就拒掉，别让用户运行期才遇到。
-    if (qualifiedToolName(id, result.tool.name).length > 64) {
-      return {
-        ok: false,
-        error: `模型侧工具名 ${qualifiedToolName(id, result.tool.name)} 超过 64 字符上限（id 与工具名合计需 ≤62）`
-      };
-    }
     tools.push(result.tool);
   }
 
