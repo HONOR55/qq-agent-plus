@@ -1,0 +1,162 @@
+{
+  "id": "qzone",
+  "apiVersion": 1,
+  "name": "QQ 空间",
+  "version": "1.0.2",
+  "description": "以机器人的身份发说说、看自己的空间、删自己发的、看好友动态并点赞评论（写入走宿主，带限频与审计）",
+  "capabilities": [
+    "tools",
+    "qzone",
+    "storage",
+    "config"
+  ],
+  "tools": [
+    {
+      "name": "post_moment",
+      "description": "发一条 QQ 空间说说。正文必填（1000 字以内）；可选配图（http(s) 图片地址，最多 9 张）与可见范围（1 公开 / 4 仅自己 / 16 指定好友 / 128 部分可见，默认 1）。这是**公开可见**的写操作：发之前先把正文读一遍，别把私聊内容、群友隐私或不确定的信息发出去；同一条正文 30 分钟内不会重复发（会报错让你改正文）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "说说正文，1-1000 字"
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "配图地址，最多 9 张，必须是 http(s):// 开头"
+          },
+          "visibility": {
+            "type": "number",
+            "enum": [
+              1,
+              4,
+              16,
+              128
+            ],
+            "description": "可见范围：1 公开（默认）/ 4 仅自己 / 16 指定好友 / 128 部分可见"
+          }
+        },
+        "required": [
+          "content"
+        ]
+      }
+    },
+    {
+      "name": "list_my_moments",
+      "description": "看机器人自己最近发过的说说（tid、正文、时间、评论数、点赞数、自己赞没赞过）。发新说说前可以先用它查重；删说说前也用它确认 tid。注意：评论数来自空间列表接口，点赞数来自好友动态页——比那一页更旧的说说点赞数会是 null（表示\"看不到\"，不是 0 个赞）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "number",
+            "description": "返回几条，默认 10，最多 30"
+          }
+        }
+      }
+    },
+    {
+      "name": "delete_moment",
+      "description": "删一条这个插件发过的说说（tid 从 post_moment 或 list_my_moments 拿）。只能删机器人自己的、且必须是这个插件最近 20 次发布里的；别人的说说删不掉。删了就没了，先确认 tid 再调。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tid": {
+            "type": "string",
+            "description": "要删的说说的 tid"
+          }
+        },
+        "required": [
+          "tid"
+        ]
+      }
+    },
+    {
+      "name": "list_friend_feeds",
+      "description": "看好友动态（只读）：返回每条动态的 tid、作者 QQ 与昵称、正文、时间（time 是 ISO、abstime 是秒级时间戳）、图片数、点赞数、评论数。要评论或点赞时必须带上返回里的 uin；点赞再带上 abstime 最稳。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "number",
+            "description": "返回几条，默认 8，最多 20"
+          }
+        }
+      }
+    },
+    {
+      "name": "like_moment",
+      "description": "给一条好友动态点赞。写入前先想一下：这是以机器人身份公开点的赞。tid / uin 从 list_friend_feeds 拿；abstime（那条动态的发布时间，秒）也一起带上最稳，不给的话宿主会自己回查一次。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tid": {
+            "type": "string",
+            "description": "动态 tid"
+          },
+          "uin": {
+            "type": "string",
+            "description": "动态作者的 QQ 号"
+          },
+          "abstime": {
+            "type": "number",
+            "description": "动态发布时间（秒），list_friend_feeds 返回的 abstime 字段；可选"
+          }
+        },
+        "required": [
+          "tid",
+          "uin"
+        ]
+      }
+    },
+    {
+      "name": "comment_moment",
+      "description": "评论一条好友动态（以机器人身份公开评论，200 字以内）。评论前建议先 read_moment_comments 看一眼已经聊到哪儿了，别复读别人的话。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tid": {
+            "type": "string",
+            "description": "动态 tid"
+          },
+          "uin": {
+            "type": "string",
+            "description": "动态作者的 QQ 号"
+          },
+          "content": {
+            "type": "string",
+            "description": "评论正文，1-200 字"
+          }
+        },
+        "required": [
+          "tid",
+          "uin",
+          "content"
+        ]
+      }
+    },
+    {
+      "name": "read_moment_comments",
+      "description": "读一条动态的完整评论（只读）：正文、作者、每条评论的 commentId / uin / 昵称 / 内容 / 是否机器人自己发的。回复别人之前先看这个。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tid": {
+            "type": "string",
+            "description": "动态 tid"
+          },
+          "uin": {
+            "type": "string",
+            "description": "动态作者的 QQ 号"
+          }
+        },
+        "required": [
+          "tid",
+          "uin"
+        ]
+      }
+    }
+  ]
+}
