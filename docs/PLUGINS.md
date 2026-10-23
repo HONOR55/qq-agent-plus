@@ -112,6 +112,33 @@
 只投**别人发的**消息（自己发的不投）：v1 插件发不了言，但等 `send` 能力开了之后，
 "自己发的也投"会变成自问自答的环。插件只能看：改不了内容、拦不住消息（它没有回执通道）。
 
+## QQ 空间（`qzone`）
+
+**为什么只能走宿主**：插件进程在 Linux 上被放进没有网络接口的命名空间，也读不到
+`config.json` 里的协议端令牌；而发说说、点赞、评论都只能由宿主那条 OneBot 连接
+（SnowLuma 的 `send_qzone_msg` / `like_qzone` / `comment_qzone`）发出。所以 `qzone`
+能力不是"给插件开个后门"，而是把宿主**已经在用**的那条路按动作粒度收窄后开放。
+
+| 方法 | 入参 | 返回 |
+| --- | --- | --- |
+| `cap.qzone.publish` | `{ content, images?, visibility? }` | `{ ok, tid, visibility, images }` |
+| `cap.qzone.mine` | `{ count? }`（默认 10，最多 30） | `{ selfUin, moments[] }` |
+| `cap.qzone.delete` | `{ tid, uin? }` | `{ ok, tid }` |
+| `cap.qzone.feeds` | `{ count? }`（默认 8，最多 20） | `{ feeds[] }` |
+| `cap.qzone.like` | `{ tid, uin, abstime? }` | `{ ok, tid, uin }` |
+| `cap.qzone.comment` | `{ tid, uin, content }` | `{ ok, tid, uin, commentId }` |
+| `cap.qzone.comments` | `{ tid, uin }` | `{ tid, uin, content, comments[] }` |
+
+- `content` 上限 1000 字（评论 200），`images` 最多 9 张、只收 `http(s)://` 或 `base64://`；
+  `visibility` 只认 `1`（公开）/ `4`（仅自己）/ `16`（指定好友）/ `128`（部分可见）。
+- **写入按插件限频**：发 / 删 / 赞 / 评合计每分钟 10 次，其中"发说说"每小时 6 条。
+  读（`mine` / `feeds` / `comments`）不吃这个配额。
+- 每次写入都会写一条带插件 id 的日志（`[plugin:<id>] 空间发布：…`），控制台日志里查得到。
+- `delete` 只能删**机器人自己**发的（别人的 tid 直接拒）；删除走 Qzone 网页接口，与宿主的
+  "回复评论"共用同一套 Cookie / `g_tk`。
+- 协议端没回 `tid` 时返回 `unknown: true` 并附一句"可能已经发出"—— **不要直接重发**：
+  Qzone 没有幂等键，重复提交就是两条说说。
+
 ## 周期任务
 
 宿主每 15 秒检查一遍：按 manifest 里声明的 `everyMs` 到点就通过 `schedule` 方法触发插件。
@@ -194,6 +221,9 @@ $DATA_DIR/plugins/weather/
 | `cap.config.get` | `config` |
 | `cap.http.request` | `http` |
 | `cap.send.text` | `send` |
+| `cap.qzone.publish` / `.delete` | `qzone` |
+| `cap.qzone.mine` / `.feeds` / `.comments` | `qzone` |
+| `cap.qzone.like` / `.comment` | `qzone` |
 
 形状最小到能照抄：
 
@@ -319,12 +349,9 @@ downloadUrl, sha256, tags }`）加进一份索引 JSON（形状见"怎么装"）
 1. 打包：`node scripts/plugin-pack.mjs examples/plugins/<你的插件>`
    —— **自测必须先过**（用宿主自己的安装器真装一遍）；
    想先在自己机器上装一遍看效果：`node src/ops.js plugins install <包>.tar.gz`；
-2. 把包提交进索引仓库的 `plugins/packages/`（**不用新建 Release**：该仓库的 CI 会把缺的包同步到
-   固定的滚动 Release `packages` 上）；
-3. 在索引仓库的 `plugins/index.json` 加一条（`downloadUrl` 指向
-   `…/releases/download/packages/<文件名>`；`sha256` 用第 1 步打印的值），
-   跑 `node scripts/verify-index.mjs --no-remote`（结构 + 仓库内产物 + sha256；新包还没上 Release，
-   远端核对由合并后的 CI 做）；
+2. 把包提交进索引仓库的 `plugins/packages/`，并挂到该仓库的一个 Release（tag 用 `v<版本>`）；
+3. 在索引仓库的 `plugins/index.json` 加一条（`downloadUrl` 指 Release；`sha256` 用第 1 步打印的值），
+   跑 `node scripts/verify-index.mjs`（结构 + 仓库内产物 + **真下载核对**）；
 4. 回到**本仓库**把 `plugins/official-packages.json` 里那个插件的期望值同步过去
    —— 它是两边的"对齐锚"：本仓库的用例拿"现打源码的 sha256"跟它比，
    **改了源码忘了重打包会立刻变红**（这条护栏在索引搬走之后换了个形式留在了本仓库）；
@@ -332,17 +359,17 @@ downloadUrl, sha256, tags }`）加进一份索引 JSON（形状见"怎么装"）
 
 **收尾其实只有一条命令**：`node scripts/plugin-publish.mjs examples/plugins/<你的插件> --index-repo <索引仓库工作副本>` ——
 打包 + 自测（不过就不许上架）→ 把包放进索引仓库 → 更新索引条目（**合并而不是覆盖**，保住原有的
-`publisher` / `signature` / `mirrors` / `downloads`，也绝不清掉 `revoked`）→ 跑离线自检 →
-打印要执行的 git 命令。加 `--push` 才会真的传资产、提交、推索引。
+`publisher` / `signature` / `mirrors` / `downloads`，也绝不清掉 `revoked`）→ 跑索引自检 →
+打印要执行的 git/gh 命令。加 `--push` 才会真的提交、建 Release/传资产、推索引。
 
 三条刻意的设计，都是被实际问题逼出来的：
 
-- **所有包共用一个滚动 Release（tag 固定 `packages`）**：加插件、升版本都不再发 Release。
-  资产只增不删（旧条目还指着旧版本），同版本号不换内容——换内容请升版本，否则同名覆盖会把
-  下载计数清零、索引里的 sha256 也会对不上。
-- **`--push` 先传资产，最后才推索引**：索引里的地址一旦公开就被"一键安装"用上了，反过来（先推索引、
-  资产传失败）所有使用者都会 404，只能再推一次修复；先传资产则失败时远端什么都没变（本地提交还在，
-  重跑即可）。推送前的自检（含真下载核对）是**硬闸门**，不过就不推。
+- **默认 tag 沿用这一条原来挂的那个 Release**（没有才看仓库里用得最多的那个）。每个插件一个 tag
+  看起来更整齐，但一条条挂在不同 Release 上时，`v<插件版本>` 会让 `downloadUrl` 指向一个不存在的
+  Release，装的人直接 404。
+- **`--push` 先建 Release、传资产，最后才推索引**：索引里的地址一旦公开就被"一键安装"用上了，
+  反过来（先推索引、Release 建失败）所有使用者都会 404，只能再推一次修复；先建 Release 则失败时
+  远端什么都没变（本地提交还在，重跑即可）。推送前的自检也是**硬闸门**，不过就不推。
 - **要改已经下架条目的状态必须显式给 `--clear-revoked`**：撤回是维护动作，不能被一次例行发布
   悄悄清掉（那等于下架的插件又变成可安装）。
 - 提交用**显式文件清单**（`plugins/index.json` + 这一个包），不用 `git add -A`：一次中断过的准备、
@@ -388,8 +415,7 @@ CI 里可选），`--json` 给机器读。
 - **资源上限由宿主强制**：堆上限默认 128MB（`--max-old-space-size`），常驻内存（RSS）超过
   **堆上限的 1.5 倍**就重启该插件进程（Linux 上采样 `/proc/<pid>/statm`；两者不用同一个数是因为
   RSS 还要装 Node 二进制与堆外开销，用同一个数会变成插件刚起来就被判超限）；工具调用每分钟
-  上限 120 次（防模型连调或失败重试风暴打爆宿主），周期任务不受此限。这两项在 `plugins.limits`
-  里调，也可以走控制台「设置 → 平台能力 → 插件宿主（高级）」；保存后按新上限重排插件进程。
+  上限 120 次（防模型连调或失败重试风暴打爆宿主），周期任务不受此限。都在 `plugins.limits` 里调。
 - **懒启动**：只有工具、不观察消息也不起周期任务的插件，进程**按需起、空闲停**
   （`plugins.lazy` 默认开，空闲 `plugins.idleMinutes` 默认 15 分钟）。工具在模型那边一直可见，
   第一次调用时宿主才起进程 —— 装了十个插件不会常驻十个进程，代价是首次调用多约 100ms。
@@ -454,8 +480,6 @@ node scripts/plugin-sign.mjs --key ~/.qq-agent-plugin-key.key --pack plugins/pac
   默认用内置的几个；**空数组＝只用原始地址**（不绕第三方）；也可以写自己的代理。
   **索引不走镜像** —— 索引是信任根，镜像能替换"该装什么"，而 sha256 只能证明"包与索引里写的一致"；
   包则被 sha256 钉住，走镜像最多是"取不到"，不可能"取到假的还装上"。
-  唯一例外是 GitHub 自己的 Contents API：`raw.githubusercontent.com` 请求失败（超时或非 200）时会换
-  `api.github.com/repos/.../contents/...`（raw 媒体类型）取同一份文件，信任根没有变化。
 
 ## 分期
 
