@@ -6,6 +6,10 @@ const DETAIL_URL =
   'https://h5.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msgdetail_v6';
 const REPLY_URL =
   'https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds';
+// 删说说没有对应的 OneBot action（点赞 / 评论有 `like_qzone` / `comment_qzone`），
+// 只能走网页接口。与回复评论同一套 Cookie + g_tk，所以放在同一个客户端里。
+const DELETE_URL =
+  'https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6';
 
 function compact(value, max = 1000) {
   // Qzone 内容与普通群消息一样是不可信外部文本：说说/评论里完全可以写
@@ -311,5 +315,40 @@ export class QzoneWebClient {
     });
     const commentId = raw.commentid ?? raw.commentId;
     return { commentId: commentId == null ? '' : String(commentId) };
+  }
+
+  /**
+   * 删一条说说（只能删自己发的；别人的 tid 交给 Qzone 侧拒，这里只做形状校验）。
+   * 返回的 `raw` 里 code/subcode 非 0 时 `#request` 已经抛错了，所以走到这里就是成功。
+   */
+  async deletePost(ownerUin, tid, signal) {
+    const ctx = await this.#context();
+    const owner = String(ownerUin || '');
+    const postId = String(tid || '');
+    if (!/^\d+$/.test(owner) || !postId) throw new Error('说说作者或 tid 无效');
+    const url = `${DELETE_URL}?${new URLSearchParams({ g_tk: ctx.gtk })}`;
+    await this.#request(url, {
+      method: 'POST',
+      headers: {
+        cookie: ctx.cookies,
+        'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        referer: `https://user.qzone.qq.com/${owner}`,
+        origin: 'https://user.qzone.qq.com',
+        'user-agent': 'Mozilla/5.0'
+      },
+      body: new URLSearchParams({
+        tid: postId,
+        uin: ctx.selfUin,
+        hostuin: owner,
+        format: 'json',
+        inCharset: 'utf-8',
+        outCharset: 'utf-8',
+        plat: 'qzone',
+        source: 'ic',
+        qzreferrer: `https://user.qzone.qq.com/${ctx.selfUin}/main`
+      }).toString(),
+      signal
+    });
+    return { ok: true, tid: postId };
   }
 }
