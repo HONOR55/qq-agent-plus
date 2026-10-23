@@ -29,10 +29,10 @@ import { Orchestrator } from '../core/orchestrator.js';
 import { DailyMomentsManager } from '../features/daily-moments.js';
 import { QzoneInteractionManager } from '../features/qzone-interactions.js';
 import { GroupDigestManager } from '../features/group-digest.js';
-import { AdminBriefingManager } from '../features/admin-briefing.js';
 import { GroupGameManager } from '../features/group-game.js';
 import { ReminderStore } from '../core/reminders.js';
 import { PluginRegistry } from '../plugins/registry.js';
+import { createQzoneGateway } from '../plugins/qzone.js';
 import { listModels, chatCompletion, resolveApiKey, cachedTokensOfUsage } from '../llm/llm.js';
 import { synthesizeSpeech } from '../llm/tts.js';
 import { generateImage, imageGenEffectiveHost, imageGenKeyStale, resolveImageGenAuth } from '../llm/image-gen.js';
@@ -48,7 +48,6 @@ import { scanModelsVision, visionResults } from '../llm/vision-scan.js';
 import { builtinVisionResults } from '../llm/model-vision-docs.js';
 import { createEventBus, todayKey, shanghaiDayStart, isSelfSender, safeSlice, sanitizeUserText, textWithQuote } from '../core/util.js';
 import { assertCanSend } from '../core/access.js';
-import { idList } from '../core/list.js';
 import { isTimeActive } from '../core/time-gate.js';
 import { timeControlState, TIME_ZONE } from '../core/time-control.js';
 import { IdentityPilotManager, inactiveIdentityPilotStatus } from '../identity/identity-pilot.js';
@@ -65,7 +64,6 @@ import { DEFAULT_CONFIG } from '../core/config.js';
 import { uiBuildStamp } from './ui-build.js';
 import { installPlugin, uninstallPlugin, fetchPluginIndexes, sha256Of, MAX_PLUGIN_ARCHIVE_BYTES, rollbackPlugin, createIndexRevokedCache, indexResultForDisplay } from '../plugins/install.js';
 import { DEFAULT_MIRROR_PREFIXES, fetchBinaryWithMirrors } from '../plugins/mirrors.js';
-import { createIndexTextFetcher } from '../plugins/index-fetch.js';
 // 平台能力门控的元数据（键→标签/工具/默认取向/配额默认）：控制台不手抄第二份，防漂移
 import {
   PLATFORM_DEFAULT_OFF, PLATFORM_GATE_LABELS, PLATFORM_QUOTA_DEFAULTS, PLATFORM_TOOL_GATES,
@@ -74,8 +72,6 @@ import {
 import { integrationStatus, updateSnowLumaPassword } from './integrations.js';
 import { createSnowlumaUpdater, baselineAlignDecision } from '../core/snowluma-update.js';
 import { hostStats } from '../core/host-stats.js';
-import { runHealthCheck } from '../core/health-check.js';
-import { isContainerRuntime, containerUpdateHint } from '../core/runtime.js';
 import { AutoUpdateManager, autoUpdatePending, readAutoUpdateState } from '../auto-update.js';
 import { checkForUpdate, ignoreVersion } from '../update-notice.js';
 
@@ -149,10 +145,10 @@ function rewriteAssetUrls(html) {
 // ── 白名单判断（移植自原版 allowed()） ───────────────────────────────────
 function allowed(kind, id, cfg) {
   const s = String(id);
-  const denyList = idList(cfg.deny?.[kind] ?? cfg.deny?.[`${kind}s`]);
-  if (denyList.includes(s)) return false;
-  const allowList = idList(cfg.allow?.[kind] ?? cfg.allow?.[`${kind}s`]);
-  if (allowList.length > 0) return allowList.includes(s);
+  const denyList = cfg.deny?.[kind] ?? cfg.deny?.[`${kind}s`] ?? [];
+  if (denyList.map(String).includes(s)) return false;
+  const allowList = cfg.allow?.[kind] ?? cfg.allow?.[`${kind}s`] ?? [];
+  if (allowList.length > 0) return allowList.map(String).includes(s);
   return cfg.allowAllWhenEmpty === true;
 }
 
@@ -257,17 +253,6 @@ function modelPricesPayload(modelOverride = null) {
     channelFeeds: channelPriceStatus(),   // 每渠道一份价目表的状态
     remote: priceFeedStatus()   // 远程价格表状态（设置页展示：来源/时间/条目数/错误）
   };
-}
-
-/**
- * 写进 console-access.txt 的"可点击地址"：监听地址是通配地址时给 127.0.0.1，
- * IPv6 字面量要加方括号（http://::1:3210 不是合法 URL）。
- */
-function consoleUrlHost(host) {
-  const value = String(host || '').trim();
-  if (!value || value === '0.0.0.0' || value === '::' || value === '::0') return '127.0.0.1';
-  if (value.includes(':') && !value.startsWith('[')) return `[${value}]`;
-  return value;
 }
 
 export function createApp({
@@ -528,13 +513,9 @@ export function createApp({
 
   // ── 组件 ──
   const visionScan = { running: false };   // 模型图片输入能力扫描的运行状态
-  const store = new ChatStore(cfg.store?.maxMessagesPerChat ?? 0, {
-    synchronous: cfg.store?.sqliteSynchronous   // FULL（默认）/ NORMAL，Issue #45
-  });   // 0 = 不限
+  const store = new ChatStore(cfg.store?.maxMessagesPerChat ?? 0);   // 0 = 不限
   const memory = new MemoryStore();
-  const sessions = new SessionRegistry(cfg.store?.keepSessionFiles ?? 0, {
-    persistIntervalMs: cfg.store?.sessionPersistMs
-  });   // 0 = 不限
+  const sessions = new SessionRegistry(cfg.store?.keepSessionFiles ?? 0);   // 0 = 不限
   let incidentPilot = null;
   let incidentPilotError = '';
   let autoUpdate = null;
@@ -604,13 +585,16 @@ export function createApp({
    * 索引里被撤回的条目（`id@版本`）：注册表据此拒载 —— 集中下架，不用每台机器改配置。
    * 缓存语义（"拉取失败时沿用旧名单，失败不许清空"）在 createIndexRevokedCache 里，那里有用例钉着。
    */
-  const indexRevokedCache = createIndexRevokedCache({ file: path.join(DATA_DIR, 'plugin-index-revoked.json') });
+  const indexRevokedCache = createIndexRevokedCache();
   // 上次成功读到的索引（失败时回落到它；见 indexResultForDisplay 的注释）
   let lastGoodPluginIndex = null;
   // 插件宿主是否已经起过。索引加载晚于 start（启动时那 5 秒竞速输了，但请求还在后台跑）
   // 时，拿到的新撤回名单要能触发一次重排 —— 否则被撤回的插件会一直跑到进程结束。
   let pluginsStarted = false;
   const indexRevokedRules = () => indexRevokedCache.rules();
+  // 插件侧的 QQ 空间出口：插件进程没有网络、也读不到协议端令牌，写说说只能走宿主这条连接。
+  // 网关本身不持有任何状态，每个插件进程启动时按 id 绑一份（写入配额按插件独立计数）。
+  const qzoneGateway = createQzoneGateway({ getOnebot: () => onebot, log: moduleLog('plugins') });
   const pluginRegistry = new PluginRegistry({
     root: path.join(DATA_DIR, 'plugins'),   // 约定目录：数据目录不会被版本更新覆盖（见 docs/PLUGINS.md）
     dataDir: DATA_DIR,
@@ -619,7 +603,9 @@ export function createApp({
     // 索引里标了 revoked 的插件一律拒载（索引改一次，所有机器下次读到就生效）
     getIndexRevoked: indexRevokedRules,
     // 插件声明 send 能力后，发言走机器人自己那条发送队列（禁言/限频/白名单/记账全在里面）
-    getSender: () => sender
+    getSender: () => sender,
+    // 插件声明 qzone 能力后，空间读写走这一条（发/删/赞/评都在宿主侧限频并留痕）
+    getQzone: () => qzoneGateway
   });
   const orchestrator = new Orchestrator({
     store,
@@ -668,13 +654,6 @@ export function createApp({
     sender,
     sessions,
     log: moduleLog('group-digest')
-  });
-  // 管理员早报：每天把过去 24 小时群里的见闻私聊给全局管理员（默认关）
-  const adminBriefing = new AdminBriefingManager({
-    store,
-    sender,
-    sessions,
-    log: moduleLog('admin-briefing')
   });
   function createIncidentPilot() {
     return new IncidentPilotManager({
@@ -771,7 +750,6 @@ export function createApp({
       { name: '关系台账', run: () => identityPilot?.pruneRelationshipHistory?.() },
       { name: '异常台账', run: () => incidentPilot?.pruneResolvedIncidents() },
       { name: '运行台账', run: () => store.pruneRuns() },
-      { name: '发送台账', run: () => store.pruneOutbox() },
       { name: '会话留档', run: () => sessions.pruneSessions() }
     ];
   }
@@ -869,10 +847,11 @@ export function createApp({
         const id = String(userId || '').trim();
         if (!/^\d{1,15}$/.test(id)) throw new Error('好友 QQ 号无效');
         const privateAllow = [...new Set([
-          ...idList(current.allow?.private),
+          ...(current.allow?.private || []).map(String),
           id
         ])];
-        const privateDeny = idList(current.deny?.private)
+        const privateDeny = (current.deny?.private || [])
+          .map(String)
           .filter((item) => item !== id);
         updateConfig({
           allow: { ...(current.allow || {}), private: privateAllow },
@@ -1013,9 +992,6 @@ export function createApp({
   }
 
   async function snowlumaAutoCheck({ first = false } = {}) {
-    // 容器里没有宿主 docker 套接字，协议端由 compose 管：更新只能换镜像，不能在这里 exec。
-    // 直接返回，连基线对齐也不做（那同样要重建协议端容器）。
-    if (isContainerRuntime()) return;
     try {
       // 启动时先做一次"随版本对齐"（默认开，只在基线真的变化时动手）；它与下面的周期检查
       // 相互独立：周期检查的开关（默认关）不受影响。
@@ -1276,8 +1252,8 @@ export function createApp({
     const cfgNow = getConfig();
     const windowMs = catchupReplyWindowMs(cfgNow);
     const targets = [
-      ...idList(cfgNow.allow?.groups).map((g) => ({ kind: 'group', id: g })),
-      ...idList(cfgNow.allow?.private).map((p) => ({ kind: 'private', id: p }))
+      ...(cfgNow.allow?.groups ?? []).map((g) => ({ kind: 'group', id: String(g) })),
+      ...(cfgNow.allow?.private ?? []).map((p) => ({ kind: 'private', id: String(p) }))
     ];
     for (const { kind, id } of targets) {
       const chatKey = `${kind}:${id}`;
@@ -1459,9 +1435,7 @@ export function createApp({
       senderName: operatorName,
       text,
       media: [],
-      eventKind: 'poke',
-      // 拍机器人 = 直接互动：档位判定与回复纠正据此把这条当"被点名"处理
-      targetUserId: targetId
+      eventKind: 'poke'
     }, { recordOnly: arrivedInactive || !isTimeActive(chatKeyNow) });
     emit('chat-update', `${isGroup ? 'group' : 'private'}:${id}`);
     orchestrator.onIncoming(`${isGroup ? 'group' : 'private'}:${id}`);
@@ -1586,16 +1560,12 @@ export function createApp({
   };
   const server = http.createServer((req, res) => {
     handleHttp(req, res).catch((error) => {
-      // 4xx 是用户输入/权限问题，不是服务端异常：不要写入异常面板，否则每次输错
-      // 管理员 QQ/非法 JSON 都会变成一条 error incident。
-      if (!(Number(error?.httpStatus) >= 400 && Number(error?.httpStatus) < 500)) {
-        incidentPilot?.capture(error, {
-          source: 'http',
-          category: 'http',
-          severity: 'error',
-          details: { method: req.method || '', pathname: String(req.url || '').split('?')[0] }
-        });
-      }
+      incidentPilot?.capture(error, {
+        source: 'http',
+        category: 'http',
+        severity: 'error',
+        details: { method: req.method || '', pathname: String(req.url || '').split('?')[0] }
+      });
       log('[http] 处理出错:', error?.message ?? error);
       try {
         res.writeHead(error?.httpStatus || 500, { 'content-type': 'application/json' });
@@ -1650,12 +1620,7 @@ export function createApp({
       chunks.push(chunk);
     }
     const text = Buffer.concat(chunks).toString('utf8');
-    if (!text) return {};
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw Object.assign(new Error('请求体不是合法 JSON'), { httpStatus: 400 });
-    }
+    return text ? JSON.parse(text) : {};
   }
 
   // 「无令牌 = 仅本机」的本机判定必须看 TCP 对端（req.socket.remoteAddress），不能只看 Host 头：
@@ -1702,9 +1667,8 @@ export function createApp({
   function writeConsoleAccess(token) {
     const file = path.join(DATA_DIR, 'console-access.txt');
     const tmp = `${file}.${process.pid}.tmp`;
-    const cfg = getConfig();
     fs.writeFileSync(tmp,
-      `QQ Agent Linux\nURL: http://${consoleUrlHost(cfg.server.host)}:${cfg.server.port}\nToken: ${token}\nMode: ${cfg.runtime.mode}\n`,
+      `QQ Agent Linux\nURL: http://${getConfig().server.host}:${getConfig().server.port}\nToken: ${token}\nMode: ${getConfig().runtime.mode}\n`,
       { mode: 0o600 });
     fs.renameSync(tmp, file);
     fs.chmodSync(file, 0o600);
@@ -1755,13 +1719,6 @@ export function createApp({
   /** 脱敏后的配置 + asr 的运行时结论（GET 与 POST 共用，界面拿到的永远是最新结论）。 */
   function safeConfigWithAsrStatus(cfgNow) {
     const safe = sanitizeConfig(cfgNow);
-    // 容器标记来自运行环境，不是用户配置，所以不落盘、每次响应现算。
-    // 控制台据此禁用"立即更新"、协议端一键更新等只对 systemd 部署有意义的操作。
-    safe.runtime = {
-      ...(safe.runtime || {}),
-      container: isContainerRuntime(),
-      updateManagedBy: isContainerRuntime() ? 'docker' : 'systemd'
-    };
     safe.asr = { ...(safe.asr || {}), ...asrStatusOf(cfgNow) };
     // tts 的 Key 被 sanitize 删掉了，用派生标志告诉界面"哪几家已存"（按供应商显示掩码）
     safe.tts = {
@@ -2013,58 +1970,11 @@ export function createApp({
   // 协议端（SnowLuma）版本 / 更新 / 回滚：控制台「设置 → OneBot」页用
   // 主机资源（只读）：总览页用。取不到的项返回 null，接口本身不因为某个指标失败而 500。
   router.add('GET', '/api/host', async (req, res) => json(res, 200, { ok: true, ...hostStats({ dir: DATA_DIR }) }));
-
-  // 一键体检：复用 `ops health-check` 的同一份巡检（控制台/协议端/入站/磁盘/更新），
-  // 只读、不通知 owner。控制台把失败项直接列出来，用户不用再 ssh 跑命令。
-  // 并发/落盘约束：一次只允许一个体检；跳过全库 integrity_check 和 health.json 写入，
-  // 否则同步 DatabaseSync 会卡住事件循环，并覆盖定时巡检的连击状态。
-  let healthCheckInFlight = null;
-  router.add('POST', '/api/health/check', async (req, res) => {
-    if (healthCheckInFlight) {
-      return json(res, 429, { busy: true, error: '体检正在进行中，请稍候' });
-    }
-    const cfgNow = getConfig();
-    const onebotPort = Number(cfgNow.onebot?.httpPort) || 3000;
-    const onebotHttpUrl = String(cfgNow.onebot?.httpUrl || '').trim()
-      || `http://127.0.0.1:${onebotPort}`;
-    const task = (async () => runHealthCheck({
-      dataDir: DATA_DIR,
-      mode: String(cfgNow.runtime?.mode || 'active'),
-      consolePort: Number(cfgNow.server?.port) || Number(process.env.QQ_AGENT_SERVER_PORT) || 3210,
-      onebotHttpPort: onebotPort,
-      onebotHttpUrl,
-      onebotToken: String(cfgNow.onebot?.httpAccessToken || cfgNow.onebot?.accessToken || ''),
-      containerRuntime: isContainerRuntime(),
-      snowlumaDir,
-      service: '',
-      notify: null,
-      persist: false,
-      integrityCheck: false
-      // 不注入 sudoDockerProbe：巡检默认会试一次 `sudo -n docker`（8 秒上限）。
-      // 固定成 false 会让"直连不可用但 sudo 回退可用"的机器在控制台里假红。
-    }))();
-    healthCheckInFlight = task;
-    try {
-      const result = await task;
-      return json(res, 200, { healthy: result.healthy, checks: result.checks });
-    } catch (error) {
-      log('[console] health check failed:', error?.message ?? error);
-      return json(res, 200, {
-        healthy: false,
-        checks: [],
-        error: String(error?.message ?? error)
-      });
-    } finally {
-      if (healthCheckInFlight === task) healthCheckInFlight = null;
-    }
-  });
   router.add('GET', '/api/snowluma/version', async (req, res) => {
     const st = await snowlumaUpdater.status();
     const auto = getConfig().autoUpdate?.snowluma || {};
     return json(res, 200, {
       ...st,
-      // 容器模式：协议端由 compose 管，版本信息仍可展示，但"一键更新/回滚"不可用。
-      container: isContainerRuntime(),
       auto: {
         enabled: auto.enabled === true,
         image: String(auto.image || ''),
@@ -2073,9 +1983,6 @@ export function createApp({
     });
   });
   router.add('POST', '/api/snowluma/update', async (req, res) => {
-    if (isContainerRuntime()) {
-      return json(res, 409, { ok: false, error: containerUpdateHint() });
-    }
     const body = await readBody(req).catch(() => ({}));
     const to = String(body?.to || getConfig().autoUpdate?.snowluma?.image || '').trim();
     const result = await snowlumaUpdater.update({ to, dryRun: body?.dryRun === true });
@@ -2086,9 +1993,6 @@ export function createApp({
     return json(res, result.ok ? 200 : 500, result);
   });
   router.add('POST', '/api/snowluma/rollback', async (req, res) => {
-    if (isContainerRuntime()) {
-      return json(res, 409, { ok: false, error: containerUpdateHint() });
-    }
     const result = await snowlumaUpdater.rollback();
     auditWrite('snowluma-rollback', result.to || 'protocol', {
       req, ok: result.ok !== false, error: result.error || ''
@@ -2102,7 +2006,6 @@ export function createApp({
   router.add('GET', '/api/qzone-interactions/status', async (req, res) => json(res, 200, qzoneInteractions.status()));
   router.add('GET', '/api/group-game/status', async (req, res) => json(res, 200, groupGame.status()));
   router.add('GET', '/api/group-digest/status', async (req, res) => json(res, 200, groupDigest.status()));
-  router.add('GET', '/api/admin-briefing/status', async (req, res) => json(res, 200, adminBriefing.status()));
   router.add('GET', '/api/tts/presets', async (req, res) => json(res, 200, { ok: true, services: TTS_SERVICES }));
   // 「平台能力」页的元数据：键 → 标签 / 它管的工具 / 默认取向（"默认关"的三项在 UI 上要标注）。
   // 让 UI 从服务端拿这份清单，而不是在 ui/ 里再抄一份 —— 抄一份就会在下次拆键时漏掉一半。
@@ -2151,11 +2054,6 @@ export function createApp({
     const body = await readBody(req);
     if (body.confirm !== true) {
       return json(res, 409, { error: '手动更新需要显式确认' });
-    }
-    // 容器里没有 update service / systemd，提交请求只会留下一个永远不执行的 pending。
-    // 在入口直接拒绝，并把正确的更新方式告诉用户。
-    if (isContainerRuntime()) {
-      return json(res, 409, { error: containerUpdateHint() });
     }
     try {
       const status = autoUpdate.requestManual({ version: body.version });
@@ -2234,9 +2132,6 @@ export function createApp({
     }
     if (body.skipBacklog === true) for (const key of store.listChats()) store.markAllRead(key);
     updateConfig({ runtime: { mode: body.mode } });
-    // 观察/暂停会挡住日报/早报；切回 active 时立刻重排并补跑当天错过的（否则要等重启）。
-    groupDigest.reconfigure();
-    adminBriefing.reconfigure();
     if (body.mode === 'active') slangPilot?.resumeQueued();
     emit('status', { mode: body.mode });
     return json(res, 200, { ok: true, mode: body.mode });
@@ -2436,14 +2331,7 @@ export function createApp({
       return;
     }
     if (sticker?.source === 'ai') {
-      // 收藏表情的远程链接过期时 findForSend 会抛 STICKER_LINK_DEAD。控制台预览一张已失效的
-      // 收藏图不是系统错误，不能记进异常面板（会在错误页留一条红项）；返回 404 让界面显示坏图。
-      try {
-        sticker = await stickers.findForSend(id);
-      } catch (error) {
-        if (error?.code === 'STICKER_LINK_DEAD') return json(res, 404, { error: '表情图片已失效' });
-        throw error;
-      }
+      sticker = await stickers.findForSend(id);
     }
     if (!sticker?.url) return json(res, 404, { error: '表情图片不存在' });
     // 远程表情图片（QQ 表情 URL 里带 md5、内容恒定）：ETag + 一天浏览器缓存。
@@ -2667,21 +2555,7 @@ export function createApp({
   const loadPluginIndex = async ({ applyRevocation = true } = {}) => {
     const sources = pluginIndexSources();
     const key = sources.map((item) => `${item.name}|${item.url}`).join(' ');
-    if (!sources.length) {
-      // 用户把索引来源清空（完全离线）：已移除来源的撤回规则不应继续生效。
-      const before = indexRevokedRules().slice().sort().join('\n');
-      indexRevokedCache.update({ sources: [], configured: [] });
-      // 缓存也必须一起清：否则 10 分钟内把同一来源加回来时，下面那行缓存命中会直接返回
-      // 旧结果、跳过 indexRevokedCache.update —— 撤回名单保持为空，kill switch 失效。
-      pluginIndexCache = { key: '', at: 0, result: { plugins: [], skipped: [], sources: [] } };
-      const after = indexRevokedRules().slice().sort().join('\n');
-      if (applyRevocation && pluginsStarted && after !== before) {
-        void pluginRegistry.reconfigure()
-          .then(() => log('[plugins] 索引来源已清空，撤回名单已更新，插件已按新名单重排'))
-          .catch((error) => log('[plugins] 按新撤回名单重排失败：', error?.message ?? error));
-      }
-      return { plugins: [], skipped: [], sources: [] };
-    }
+    if (!sources.length) return { plugins: [], skipped: [], sources: [] };
     if (pluginIndexCache.key === key && Date.now() - pluginIndexCache.at < 10 * 60_000) return pluginIndexCache.result;
     // 索引地址是用户填的 URL → 走 safe-fetch（内网/SSRF/体积/超时都在里面）
     // hostVersion 用于兼容门控（条目标了 minVersion 时判断本机够不够），不是网络参数
@@ -2689,18 +2563,13 @@ export function createApp({
     // 因为索引是信任根：镜像能替换"该装什么"（塞一条它自己的插件 + 它自己的 sha256），
     // 而 sha256 只能证明"包与索引里写的一致"——索引被换掉时它救不了你。
     // 包则不同：包被 sha256 钉住，走镜像最多是"取不到"，不可能"取到假的还装上"（见 mirrors.js）。
-    // 索引拉不动时的兜底：10 分钟缓存、页面明确报错、把 indexUrls 指向自己的 fork，
-    // 以及 raw.githubusercontent.com 超时时自动换 GitHub Contents API（见 index-fetch.js；
-    // 仍然只信任 GitHub，不经过第三方 CDN）。
+    // 索引拉不动时的兜底是三件事：10 分钟缓存、页面明确报错、以及你可以把 indexUrls 指向自己的 fork/镜像。
     // 索引是结构化文件，会随条目增多长过网页那份 50KB 上限：给它单独的体积上限
     //（SSRF / 超时 / 重定向守卫仍是 safeFetch 那一套）
     const fresh = await fetchPluginIndexes({
       sources,
-      // 原始地址 10 秒（被墙时别让页面干等 25 秒），API 兜底 15 秒；两者都是总截止
-      fetchText: createIndexTextFetcher({
-        fetchImpl: (url, options) => safeFetch(url, options),
-        log: moduleLog('plugins')
-      }),
+      // 总截止 25 秒（不是空闲超时）：索引源可以慢，但不能靠"每 19 秒吐一个字节"把请求吊住
+      fetchText: (url) => safeFetch(url, { maxBytes: 4 * 1024 * 1024, signal: AbortSignal.timeout(25_000) }),
       log: moduleLog('plugins'), hostVersion: PKG.version
     });
     // 拉不到就用上次成功读到的（见 indexResultForDisplay）：索引挂在第三方托管上，偶发超时是常态，
@@ -2713,11 +2582,7 @@ export function createApp({
     // 名单变化要立刻反映到正在跑的插件上：启动时那次加载可能输给了 5 秒竞速（请求仍在后台跑），
     // 页面打开/定时刷新也可能在运行中拿到新名单 —— 只在下一轮 start 才生效等于 kill switch 失效。
     const rulesBefore = indexRevokedRules().slice().sort().join('\n');
-    indexRevokedCache.update({
-      ...fresh,
-      // 显式告诉缓存"现在配置着哪些来源"：全部拉取失败时也能正确移除已删来源的规则。
-      configured: sources.map((item) => String(item.url || item.name || ''))
-    });
+    indexRevokedCache.update(fresh);
     const rulesAfter = indexRevokedRules().slice().sort().join('\n');
     if (applyRevocation && pluginsStarted && rulesAfter !== rulesBefore) {
       void pluginRegistry.reconfigure()
@@ -2733,12 +2598,7 @@ export function createApp({
    * 网络抖动不该拖慢启动：最多等 ms 毫秒，拉不到就按本地配置先起，定时刷新会补。
    */
   const warmPluginIndexForRevocation = async (ms = 5000) => {
-    if (!pluginIndexSources().length) {
-      // 无来源也要走一次 loadPluginIndex：它会清空已移除来源的撤回规则；否则重启后
-      // 仍按上一次磁盘里的旧规则拒载插件（2026-10-19 复核 P2）。
-      await loadPluginIndex().catch(() => 'failed');
-      return 'no-source';
-    }
+    if (!pluginIndexSources().length) return 'no-source';
     let timer = null;
     const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve('timeout'), ms); timer.unref?.(); });
     try {
@@ -2755,9 +2615,7 @@ export function createApp({
     pluginIndexRefreshTimer = setInterval(() => {
       if (getConfig().plugins?.enabled !== true) return;
       const before = [...indexRevokedRules()].sort().join('\n');
-      // applyRevocation:false：定时器自己比较前后并只重排一次。loadPluginIndex 内部默认
-      // 也会重排，叠加起来会让所有插件被完整重启两遍。
-      void loadPluginIndex({ applyRevocation: false }).then(() => {
+      void loadPluginIndex().then(() => {
         const after = [...indexRevokedRules()].sort().join('\n');
         if (after === before) return null;
         return pluginRegistry.reconfigure()
@@ -3025,7 +2883,7 @@ export function createApp({
     // 白名单里的群没有记忆也要显示
     const seen = new Set(files.map((f) => f.chatKey));
     // 补上白名单里还没有记忆的会话（缺字段也要有默认值，前端统一处理）
-    for (const gid of idList(getConfig().allow?.groups)) {
+    for (const gid of (getConfig().allow?.groups || [])) {
       const key = `group:${String(gid)}`;
       if (!seen.has(key)) {
         files.push({
@@ -3034,7 +2892,7 @@ export function createApp({
         });
       }
     }
-    for (const uid of idList(getConfig().allow?.private)) {
+    for (const uid of (getConfig().allow?.private || [])) {
       const key = `private:${String(uid)}`;
       if (!seen.has(key)) {
         files.push({
@@ -3230,12 +3088,6 @@ export function createApp({
   });
   router.add('POST', '/api/asr/install', async (req, res) => {
     if (!keyEndpointAllowed(req)) return json(res, 403, { error: '请求来源不被信任，已拒绝。' });
-    if (isContainerRuntime()) {
-      return json(res, 409, {
-        error: '容器模式不支持在容器内编译 whisper.cpp（镜像里没有 git/cmake/编译工具）。'
-          + '请改用托管 ASR，或构建包含 whisper.cpp 的自定义镜像。'
-      });
-    }
     try {
       const started = startAsrInstall();
       auditWrite('asr.install', '', { req, after: started });
@@ -3821,14 +3673,12 @@ export function createApp({
     const totals = dailyStats.totals;
     const usage = {
       dayKey,
-      // token / 次数从 usage-today + 运行中会话直接取（实时）；cost 仍来自会话文件聚合，
-      // 最多滞后 USAGE_CACHE_TTL_MS（Issue #45：不能让顶栏轮询驱动全量扫盘）。
-      promptTokens: sessionUsage.promptTokens,
-      completionTokens: sessionUsage.completionTokens,
-      totalTokens: sessionUsage.totalTokens,
-      cachedTokens: sessionUsage.cachedTokens,
+      promptTokens: totals.promptTokens,
+      completionTokens: totals.completionTokens,
+      totalTokens: totals.totalTokens,
+      cachedTokens: totals.cachedTokens,
       runs: sessionUsage.runs,
-      webSearchCount: sessionUsage.webSearchCount,
+      webSearchCount: dailyStats.searchCount,
       // 改进方案 #8：当日估算金额与未计价运行数（budgetStatus 的口径来源）
       estimatedYuan: Number(sessionUsage.estimatedYuan) || 0,
       unpricedRuns: Number(sessionUsage.unpricedRuns) || 0
@@ -3894,8 +3744,7 @@ export function createApp({
       // 改进方案 #6：最近一次运行的 trace id（拿它去 journalctl / 日志文件捞整条链路）
       lastTraceId: lastTraceId(),
       cost,
-      // 与 usage 同口径（实时）：cached/prompt；totals 的命中率来自滞后的会话聚合
-      cacheHitRate: usage.promptTokens ? Math.min(1, usage.cachedTokens / usage.promptTokens) : 0,
+      cacheHitRate: totals.cacheHitRate,
       webSearchCount: usage.webSearchCount || 0,
       // 前端构建戳：轮询时发现它变了 → 前端提示"控制台已更新，点击刷新"
       uiBuild: uiBuildStamp(UI_DIR),
@@ -4361,14 +4210,10 @@ export function createApp({
       next = updateConfig(patch);
     } catch (error) {
       auditWrite('config.update', 'config', { req, before: auditBefore, ok: false, error: String(error?.message ?? error) });
-      // updateConfig 的校验错误自带 httpStatus=400（见 config-legacy 的 invalidConfig）；
-      // 文件系统/内部错误没有这个标记，按 500 处理并进异常面板。
       throw error;
     }
     auditWrite('config.update', 'config', { req, before: auditBefore, after: next, changed: changedTopKeys(auditBefore, next) });
     store.setMaxPerChat(next.store?.maxMessagesPerChat ?? 0);
-    store.setSynchronous(next.store?.sqliteSynchronous);
-    sessions.setPersistIntervalMs(next.store?.sessionPersistMs);
     let closedThreads = 0;
     for (const [chatKey, previousMode] of previousModes) {
       if (conversationConfigForChat(chatKey).mode !== previousMode) {
@@ -4388,11 +4233,6 @@ export function createApp({
     }
     if (JSON.stringify(next.groupDigest || {}) !== JSON.stringify(cfgNow.groupDigest || {})) {
       groupDigest.reconfigure();
-    }
-    if (JSON.stringify(next.adminBriefing || {}) !== JSON.stringify(cfgNow.adminBriefing || {})
-      || String(next.admin?.ownerUin || '') !== String(cfgNow.admin?.ownerUin || '')) {
-      // 管理员 QQ 后补上时也要重新排程（否则要等进程重启才会有定时器）
-      adminBriefing.reconfigure();
     }
     // 插件配置动了（总开关 / enabledIds / 插件自己的 settings）→ 重排：停掉再按新配置起。
     // 不 await：控制台保存不该等插件起进程（宿主内部自己 try/catch 并记日志）。
@@ -4475,14 +4315,6 @@ export function createApp({
   router.add('POST', '/api/group-digest/run', async (req, res) => {
     try {
       const result = await groupDigest.runOnce();
-      return json(res, 200, { ok: true, ...result });
-    } catch (error) {
-      return json(res, 400, { ok: false, error: String(error?.message ?? error) });
-    }
-  });
-  router.add('POST', '/api/admin-briefing/run', async (req, res) => {
-    try {
-      const result = await adminBriefing.runOnce();
       return json(res, 200, { ok: true, ...result });
     } catch (error) {
       return json(res, 400, { ok: false, error: String(error?.message ?? error) });
@@ -4611,8 +4443,8 @@ export function createApp({
     const now = Date.now();
     const keys = [...new Set([
       ...store.listChats(),
-      ...idList(cfgNow.allow?.groups).map((id) => `group:${id}`),
-      ...idList(cfgNow.allow?.private).map((id) => `private:${id}`),
+      ...(cfgNow.allow?.groups || []).map((id) => `group:${id}`),
+      ...(cfgNow.allow?.private || []).map((id) => `private:${id}`),
       ...Object.keys(cfgNow.timeControl?.overrides || {})
     ])];
     return json(res, 200, {
@@ -4995,22 +4827,14 @@ export function createApp({
           ? inm.split(',').some((t) => t.trim() === etag || t.trim() === `W/${etag}` || `W/${t.trim()}` === etag)
           : (ext !== '.html' && String(req.headers['if-modified-since'] || '') !== ''
             && Date.parse(req.headers['if-modified-since']) >= Math.floor(stat.mtimeMs / 1000) * 1000);
-        const securityHeaders = {
-          // 控制台可被本机无令牌模式打开：禁止被第三方页面 iframe 嵌入，防点击劫持。
-          'x-frame-options': 'DENY',
-          'content-security-policy': "frame-ancestors 'none'",
-          'referrer-policy': 'no-referrer'
-        };
         if (matched) {
-          // 304 也要带安全头：否则升级前缓存过 index.html 的浏览器会一直复用旧响应，防护不生效。
-          res.writeHead(304, { ...securityHeaders, etag, 'cache-control': cacheControl });
+          res.writeHead(304, { etag, 'cache-control': cacheControl });
           res.end();
           return;
         }
         res.writeHead(200, {
           'content-type': types[ext] ?? 'application/octet-stream',
           'cache-control': cacheControl,
-          ...securityHeaders,
           etag,
           'last-modified': stat.mtime.toUTCString()
         });
@@ -5091,7 +4915,6 @@ export function createApp({
     if (getConfig().dailyMoments?.enabled) dailyMoments.start();
     if (getConfig().qzoneInteractions?.enabled) qzoneInteractions.start();
     if (getConfig().groupDigest?.enabled) groupDigest.start();
-    if (getConfig().adminBriefing?.enabled) adminBriefing.start();
     groupGame.startLoop();   // 内部按配置判断是否推进；重启后从磁盘恢复进行中的局
     if (getConfig().proactive?.enabled) orchestrator.startProactiveLoop();
     orchestrator.startScheduledWakeTicker();
@@ -5120,17 +4943,13 @@ export function createApp({
       log('[plugins] 插件宿主启动失败：', error);
     }
     startPluginIndexRefresh();
-    if (isContainerRuntime()) {
-      log('[auto-update] 容器模式：应用与协议端都由镜像管理，跳过自动更新通知器与协议端定时器');
-    } else {
-      autoUpdate.start();
-      // 协议端自动更新：首检延迟 2 分钟（别跟启动抢 IO），之后每 6 小时一轮；开关默认关
-      clearTimeout(snowlumaAutoTimer);
-      snowlumaAutoStopped = false;
-      snowlumaAutoTimer = setTimeout(() => { snowlumaAutoCheck({ first: true }); }, 120_000);
-      snowlumaAutoTimer.unref?.();
-    }
+    autoUpdate.start();
     log(`控制台已就绪：http://${serverCfg.host}:${port} (${getConfig().runtime.mode})`);
+    // 协议端自动更新：首检延迟 2 分钟（别跟启动抢 IO），之后每 6 小时一轮；开关默认关
+    clearTimeout(snowlumaAutoTimer);
+    snowlumaAutoStopped = false;
+    snowlumaAutoTimer = setTimeout(() => { snowlumaAutoCheck({ first: true }); }, 120_000);
+    snowlumaAutoTimer.unref?.();
     log(`OneBot: ws=${getConfig().onebot?.wsUrl} http=${getConfig().onebot?.httpUrl}`);
     log(`模型: ${getConfig().api.model || '（未设置，请在设置里选择）'} @ ${getConfig().api.baseUrl}`);
     return port;
@@ -5161,7 +4980,6 @@ export function createApp({
     // 且群游戏 tick 会把 games.json 再写一遍（2026-10-07 复审 P3）。
     groupGame.stopLoop();
     groupDigest.stop();
-    adminBriefing.stop();
     // 插件子进程要在 onebot 关闭之前停掉：停机后不该再有插件在读消息
     await pluginRegistry.stop();
     await qzoneInteractions.abort();
@@ -5464,30 +5282,25 @@ function buildSessionView(s, store, options = {}) {
 // 所以可靠性绑定在下面两条失效策略上，别把它当不可变数据用。
 //
 // 失效策略（双保险，任一条命中就重算）：
-//   1. 文件集合变化：新增/删除会话文件（Issue #45：以前用目录 mtime，而运行中的会话每
-//      2 秒 rename 重写一次会话文件 —— rename 会改目录 mtime，等于每次写盘都让缓存失效，
-//      控制台开着时 /api/status 几乎每次都全量扫盘。文件名集合只在增删时变）。
-//   2. TTL 到期：120 秒（见 USAGE_CACHE_TTL_MS），兜住"内容被改写但文件名不变"（会话结束时
-//      的最终统计最多晚 2 分钟进用量页；顶栏的 token 数另有实时来源）。
-//      用量统计不是实时数据，2 分钟的新鲜度可以接受。
+//   1. 目录快照变化：文件数或目录 mtime 变了（新增/删除会话）
+//   2. TTL 到期：60 秒（见 USAGE_CACHE_TTL_MS）。兜住"内容被改写但目录快照不变"这类边缘情况。
+//      用量统计不是实时数据，1 分钟的新鲜度完全够用。
 //      另外前端还有一层：切过去先用上次数据立即渲染，不等网络。
 // 2026-10-02 复审：缓存改成**按 range 分槽的 Map** —— 单槽时 /api/status 每 15 秒用
 // range='today' 调一次（它要日统计），与用量页的 range='7' 交替覆盖同一个槽，导致 key
 // 永远对不上、缓存实际从未命中（用量页每次打开仍全量扫）。分槽后各自的 TTL 独立生效。
 const usageRowsCache = new Map();
 const USAGE_CACHE_MAX_KEYS = 8;
-const USAGE_CACHE_TTL_MS = 120000;  // Issue #45：60 → 120 秒。签名不再随运行中重写抖动，
-                                    // 2 分钟一次全量扫描足以覆盖新会话与最终统计
+const USAGE_CACHE_TTL_MS = 60000;   // 2026-10-02：20 秒 → 60 秒，打开用量页大多命中缓存；
+                                    // 新会话最多晚 1 分钟进统计，换来不再每次打开都全量扫描
 
-/**
- * 缓存签名：排序后的文件名集合（哈希）。只看增删，不看 mtime —— 运行中的会话重写
- * 不会让缓存失效；会话结束的最终统计由 TTL 兜住。
- */
-export function sessionsDirSignature() {
+/** 目录快照：文件数 + 目录 mtime。成本低（一次 stat），足以捕捉增删。 */
+function sessionsDirSignature() {
   const dir = path.join(DATA_DIR, 'sessions');
   try {
-    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort();
-    return crypto.createHash('sha1').update(files.join('\n')).digest('hex');
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+    const st = fs.statSync(dir);
+    return files.length + ':' + st.mtimeMs;
   } catch {
     return '';
   }
@@ -5496,9 +5309,7 @@ export function sessionsDirSignature() {
 function collectUsageRows({ range }) {
   const win = resolveRange(range);
   // 命中缓存就直接返回（注意 rows 会被调用方改写字段，所以必须给副本）
-  // 窗口也进签名：TTL 跨过午夜时，同一个文件名集合下 today/7 天的起点已经变了，
-  // 不能再命中前一天算好的 rows（否则今日花费会把昨天整天算进来）。
-  const sig = sessionsDirSignature() + '@' + String(range) + '@' + String(win?.start ?? '') + '-' + String(win?.end ?? '');
+  const sig = sessionsDirSignature() + '@' + String(range);
   const hit = usageRowsCache.get(sig);
   if (hit && (Date.now() - hit.at) < USAGE_CACHE_TTL_MS) {
     return {
